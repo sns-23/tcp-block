@@ -75,7 +75,6 @@ int find_http_data(char *packet)
 {
     char *tcp_data;
     size_t tcp_data_len;
-    char *buf;
 
     tcp_data = tcp_data(packet);
     tcp_data_len = tcp_data_len(packet);
@@ -114,7 +113,7 @@ char *gen_forward_pkt(char *org_pkt)
     if (forward_pkt == NULL)
         return NULL;
 
-    forward_ethhdr = forward_pkt;
+    forward_ethhdr = eth_hdr(forward_pkt);
     memcpy(forward_ethhdr->h_dest, eth_hdr(org_pkt)->h_dest, ETH_ALEN);
     memcpy(forward_ethhdr->h_source, &my_mac_addr, ETH_ALEN);
     forward_ethhdr->h_proto = htons(ETH_P_IP);
@@ -285,7 +284,6 @@ out_error:
 void callback(char *useless, const struct pcap_pkthdr *pkthdr, 
                 char *packet)
 {
-    char *host;
     int ret;
 
     ret = find_http_data(packet);
