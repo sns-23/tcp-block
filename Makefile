@@ -1,5 +1,5 @@
 CC = gcc
-CFLAGS = -g 
+CFLAGS = -g -Wall
 LDFLAGS = -lpcap -DUSE_RAWSOCKET
 OBJS = main.o util.o checksum.o
 
