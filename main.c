@@ -119,7 +119,7 @@ char *gen_forward_pkt(char *org_pkt)
     memcpy(forward_ethhdr->h_source, &my_mac_addr, ETH_ALEN);
     forward_ethhdr->h_proto = htons(ETH_P_IP);
 
-    forward_iphdr = (char *)forward_ethhdr + sizeof(*forward_ethhdr);
+    forward_iphdr = ip_hdr(forward_pkt);
     /* There are no additional options */
     memcpy(forward_iphdr, ip_hdr(org_pkt), sizeof(*forward_iphdr));
     forward_iphdr->ihl = sizeof(*forward_iphdr) / 4;
@@ -127,7 +127,7 @@ char *gen_forward_pkt(char *org_pkt)
     forward_iphdr->check = 0;
     forward_iphdr->check = ip_fast_csum(forward_iphdr, forward_iphdr->ihl);
 
-    forward_tcphdr = (char *)forward_iphdr + sizeof(*forward_iphdr);
+    forward_tcphdr = tcp_hdr(forward_pkt);
     memcpy(forward_tcphdr, tcp_hdr(org_pkt), sizeof(*forward_tcphdr));
     forward_tcphdr->th_seq = htonl(ntohl(tcp_hdr(org_pkt)->th_seq) + tcp_data_len(org_pkt));
     forward_tcphdr->th_off = sizeof(*forward_tcphdr) / 4;
