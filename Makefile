@@ -1,6 +1,6 @@
 CC = gcc
 CFLAGS = -g -Wall
-LDFLAGS = -lpcap -DUSE_RAWSOCKET
+LDFLAGS = -lpcap
 OBJS = main.o util.o checksum.o
 
 tcp-block: $(OBJS)
