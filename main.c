@@ -18,9 +18,19 @@
 
 #define ARRAY_SIZE(x) (sizeof(x) / sizeof((x)[0]))
 
-#define ip_hdr(pkt) ((struct iphdr *)((char *)pkt + ETH_HLEN))
-#define tcp_hdr(pkt) ((struct tcphdr *)((char *)ip_hdr(pkt) + ip_hdr(pkt)->ihl * 4))
-#define pkt_len(pkt) (ntohs(ip_hdr(pkt)->tot_len) + ETH_HLEN)
+#define eth_hdr(pkt) ((struct ethhdr *)(pkt))
+#define eth_hdr_len(pkt) (ETH_HLEN)
+#define ip_hdr(pkt) ((struct iphdr *)((char *)(pkt) + eth_hdr_len(pkt)))
+#define ip_hdr_len(pkt) (ip_hdr(pkt)->ihl * 4)
+#define ip_len(pkt) (ntohs(ip_hdr(pkt)->tot_len))
+#define ip_data(pkt) ((char *)ip_hdr(pkt) + ip_hdr_len(pkt))
+#define ip_data_len(pkt) (ip_len(pkt) - ip_hdr_len(pkt))
+#define tcp_hdr(pkt) ((struct tcphdr *)((char *)ip_hdr(pkt) + ip_hdr_len(pkt)))
+#define tcp_hdr_len(pkt) (tcp_hdr(pkt)->th_off * 4)
+#define tcp_len(pkt) (ip_len(pkt) - ip_hdr_len(pkt))
+#define tcp_data(pkt) ((char *)tcp_hdr(pkt) + tcp_hdr_len(pkt))
+#define tcp_data_len(pkt) (tcp_len(pkt) - tcp_hdr_len(pkt))
+#define pkt_len(pkt) (eth_hdr_len(pkt) + ip_len(pkt))
 
 #define FINMSG "HTTP/1.0 302 Redirect\r\nLocation: http://warning.or.kr\r\n\r\n"
 
@@ -61,32 +71,14 @@ bool check_http(char *packet)
     return false;
 }
 
-int find_http_data(char *packet, char **bufptr, size_t *n)
+int find_http_data(char *packet)
 {
-    struct ethhdr *ethhdr;
-    struct iphdr *iphdr;
-    struct tcphdr *tcphdr;
     char *tcp_data;
     size_t tcp_data_len;
     char *buf;
 
-    ethhdr = packet;
-
-    /* ethhdr->h_proto == ETH_P_IP has already been checked by the pcap filter */
-    iphdr = (char *)ethhdr + sizeof(*ethhdr);
-
-    /* iphdr->protocol == IPPROTO_TCP has already been checked by the pcap filter */
-    tcphdr = (char *)iphdr + iphdr->ihl * 4;
-    tcp_data = (char *)tcphdr + tcphdr->th_off * 4;
-    tcp_data_len = ntohs(iphdr->tot_len) - (iphdr->ihl + tcphdr->th_off) * 4;
-
-    if (*bufptr == NULL)
-        buf = malloc(tcp_data_len + 1);
-    else
-        buf = *bufptr;
-
-    if (buf == NULL)
-        return -1;
+    tcp_data = tcp_data(packet);
+    tcp_data_len = tcp_data_len(packet);
 
     /* 
      * minimun length of http request is always greater than 16 bytes
@@ -95,13 +87,12 @@ int find_http_data(char *packet, char **bufptr, size_t *n)
     if (tcp_data_len < 16)
         return -1;
 
+    /* 
+     * TODO: Attacker can bypass this check by simply adding \r\n before HTTP Header
+     *       The better checker is required
+     */
     if (check_http(tcp_data) == false)
         return -1;
-
-    memcpy(buf, tcp_data, tcp_data_len);
-    buf[tcp_data_len] = '\0';
-    *bufptr = buf;
-    *n = tcp_data_len;
 
     return 0;
 }
@@ -111,37 +102,34 @@ char *find_pattern(char *http_data, size_t http_data_len)
     return memmem(http_data, http_data_len, pattern, strlen(pattern));
 }
 
-char *gen_forward_pkt(struct ethhdr *org_ethhdr, struct iphdr *org_iphdr, struct tcphdr *org_tcphdr)
+char *gen_forward_pkt(char *org_pkt)
 {
     struct ethhdr *forward_ethhdr;
     struct iphdr *forward_iphdr;
     struct tcphdr *forward_tcphdr;
     char *forward_pkt;
-    size_t org_tcpdata_len;
     uint32_t checksum;
-
-    org_tcpdata_len = ntohs(org_iphdr->tot_len) - (org_iphdr->ihl + org_tcphdr->th_off) * 4;
     
     forward_pkt = malloc(sizeof(*forward_ethhdr) + sizeof(*forward_iphdr) + sizeof(*forward_tcphdr));
     if (forward_pkt == NULL)
         return NULL;
 
     forward_ethhdr = forward_pkt;
-    memcpy(forward_ethhdr->h_dest, org_ethhdr->h_dest, ETH_ALEN);
+    memcpy(forward_ethhdr->h_dest, eth_hdr(org_pkt)->h_dest, ETH_ALEN);
     memcpy(forward_ethhdr->h_source, &my_mac_addr, ETH_ALEN);
     forward_ethhdr->h_proto = htons(ETH_P_IP);
 
     forward_iphdr = (char *)forward_ethhdr + sizeof(*forward_ethhdr);
     /* There are no additional options */
-    memcpy(forward_iphdr, org_iphdr, sizeof(*forward_iphdr));
+    memcpy(forward_iphdr, ip_hdr(org_pkt), sizeof(*forward_iphdr));
     forward_iphdr->ihl = sizeof(*forward_iphdr) / 4;
     forward_iphdr->tot_len = htons(sizeof(*forward_iphdr) + sizeof(*forward_tcphdr));
     forward_iphdr->check = 0;
     forward_iphdr->check = ip_fast_csum(forward_iphdr, forward_iphdr->ihl);
 
     forward_tcphdr = (char *)forward_iphdr + sizeof(*forward_iphdr);
-    memcpy(forward_tcphdr, org_tcphdr, sizeof(*forward_tcphdr));
-    forward_tcphdr->th_seq = htonl(ntohl(org_tcphdr->th_seq) + org_tcpdata_len);
+    memcpy(forward_tcphdr, tcp_hdr(org_pkt), sizeof(*forward_tcphdr));
+    forward_tcphdr->th_seq = htonl(ntohl(tcp_hdr(org_pkt)->th_seq) + tcp_data_len(org_pkt));
     forward_tcphdr->th_off = sizeof(*forward_tcphdr) / 4;
     forward_tcphdr->th_flags = 0;
     forward_tcphdr->rst = true;
@@ -149,51 +137,47 @@ char *gen_forward_pkt(struct ethhdr *org_ethhdr, struct iphdr *org_iphdr, struct
     forward_tcphdr->ack = true;
     forward_tcphdr->th_sum = 0;
 
-    checksum = csum_partial(forward_tcphdr, ntohs(forward_iphdr->tot_len) - forward_iphdr->ihl * 4, 0);
+    checksum = csum_partial(forward_tcphdr, ip_data_len(forward_pkt), 0);
     forward_tcphdr->th_sum = csum_tcpudp_magic(forward_iphdr->saddr, forward_iphdr->daddr, 
-                                               ntohs(forward_iphdr->tot_len) - forward_iphdr->ihl * 4, 
-                                               forward_iphdr->protocol, checksum);
+                                               ip_data_len(forward_pkt), forward_iphdr->protocol, checksum);
     return forward_pkt;
 }
 
-char *gen_backward_pkt(struct ethhdr *org_ethhdr, struct iphdr *org_iphdr, struct tcphdr *org_tcphdr)
+char *gen_backward_pkt(char *org_pkt)
 {
     struct ethhdr *backward_ethhdr;
     struct iphdr *backward_iphdr;
     struct tcphdr *backward_tcphdr;
     char *backward_pkt;
-    size_t org_tcpdata_len;
     uint32_t checksum;
-
-    org_tcpdata_len = ntohs(org_iphdr->tot_len) - (org_iphdr->ihl + org_tcphdr->th_off) * 4;
     
     backward_pkt = malloc(sizeof(*backward_ethhdr) + sizeof(*backward_iphdr) + 
                             sizeof(*backward_tcphdr) + sizeof(FINMSG));
     if (backward_pkt == NULL)
         return NULL;
 
-    backward_ethhdr = backward_pkt;
-    memcpy(backward_ethhdr->h_dest, org_ethhdr->h_source, ETH_ALEN);
+    backward_ethhdr = eth_hdr(backward_pkt);
+    memcpy(backward_ethhdr->h_dest, eth_hdr(org_pkt)->h_source, ETH_ALEN);
     memcpy(backward_ethhdr->h_source, &my_mac_addr, ETH_ALEN);
     backward_ethhdr->h_proto = htons(ETH_P_IP);
 
-    backward_iphdr = (char *)backward_ethhdr + sizeof(*backward_ethhdr);
+    backward_iphdr = ip_hdr(backward_pkt);
     /* There are no additional options */
-    memcpy(backward_iphdr, org_iphdr, sizeof(*backward_iphdr));
+    memcpy(backward_iphdr, ip_hdr(org_pkt), sizeof(*backward_iphdr));
     backward_iphdr->ihl = sizeof(*backward_iphdr) / 4;
     backward_iphdr->tot_len = htons(sizeof(*backward_iphdr) + sizeof(*backward_tcphdr) + sizeof(FINMSG) - 1);
     backward_iphdr->ttl = 128;
-    backward_iphdr->saddr = org_iphdr->daddr;
-    backward_iphdr->daddr = org_iphdr->saddr;
+    backward_iphdr->saddr = ip_hdr(org_pkt)->daddr;
+    backward_iphdr->daddr = ip_hdr(org_pkt)->saddr;
     backward_iphdr->check = 0;
     backward_iphdr->check = ip_fast_csum(backward_iphdr, backward_iphdr->ihl);
 
-    backward_tcphdr = (char *)backward_iphdr + sizeof(*backward_iphdr);
-    memcpy(backward_tcphdr, org_tcphdr, sizeof(*backward_tcphdr));
-    backward_tcphdr->th_seq = org_tcphdr->th_ack;
-    backward_tcphdr->th_ack = htonl(ntohl(org_tcphdr->th_seq) + org_tcpdata_len);
-    backward_tcphdr->th_sport = org_tcphdr->th_dport;
-    backward_tcphdr->th_dport = org_tcphdr->th_sport;
+    backward_tcphdr = tcp_hdr(backward_pkt);
+    memcpy(backward_tcphdr, tcp_hdr(org_pkt), sizeof(*backward_tcphdr));
+    backward_tcphdr->th_seq = tcp_hdr(org_pkt)->th_ack;
+    backward_tcphdr->th_ack = htonl(ntohl(tcp_hdr(org_pkt)->th_seq) + tcp_data_len(org_pkt));
+    backward_tcphdr->th_sport = tcp_hdr(org_pkt)->th_dport;
+    backward_tcphdr->th_dport = tcp_hdr(org_pkt)->th_sport;
     backward_tcphdr->th_off = sizeof(*backward_tcphdr) / 4;
     backward_tcphdr->th_flags = 0;
     backward_tcphdr->fin = true;
@@ -203,10 +187,9 @@ char *gen_backward_pkt(struct ethhdr *org_ethhdr, struct iphdr *org_iphdr, struc
 
     memcpy(backward_tcphdr + 1, FINMSG, sizeof(FINMSG) - 1);
 
-    checksum = csum_partial(backward_tcphdr, ntohs(backward_iphdr->tot_len) - backward_iphdr->ihl * 4, 0);
+    checksum = csum_partial(backward_tcphdr, ip_data_len(backward_pkt), 0);
     backward_tcphdr->th_sum = csum_tcpudp_magic(backward_iphdr->saddr, backward_iphdr->daddr, 
-                                                ntohs(backward_iphdr->tot_len) - backward_iphdr->ihl * 4, 
-                                                backward_iphdr->protocol, checksum);
+                                                ip_data_len(backward_pkt), backward_iphdr->protocol, checksum);
 
     return backward_pkt;
 }
@@ -235,22 +218,15 @@ int init_raw_sk()
 
 int send_blocking_pkt(char *org_pkt)
 {
-    struct ethhdr *org_ethhdr;
-    struct iphdr *org_iphdr;
-    struct tcphdr *org_tcphdr;
     char *forward_pkt;
     char *backward_pkt;
     int ret;
-
-    org_ethhdr = org_pkt;
-    org_iphdr = ip_hdr(org_pkt);
-    org_tcphdr = tcp_hdr(org_pkt);
     
-    forward_pkt = gen_forward_pkt(org_ethhdr, org_iphdr, org_tcphdr);
+    forward_pkt = gen_forward_pkt(org_pkt);
     if (forward_pkt == NULL)
         goto out_error;
 
-    backward_pkt = gen_backward_pkt(org_ethhdr, org_iphdr, org_tcphdr);
+    backward_pkt = gen_backward_pkt(org_pkt);
     if (backward_pkt == NULL) 
         goto out_error;
 
@@ -270,7 +246,7 @@ int send_blocking_pkt(char *org_pkt)
     addr.sin_family = AF_INET;
     addr.sin_port = tcp_hdr(backward_pkt)->th_dport;
     addr.sin_addr.s_addr = ip_hdr(backward_pkt)->daddr;
-    ret = sendto(sk, ip_hdr(backward_pkt), ntohs(ip_hdr(backward_pkt)->tot_len), 0, &addr, sizeof(addr));
+    ret = sendto(sk, ip_hdr(backward_pkt), ip_len(backward_pkt), 0, &addr, sizeof(addr));
     if (ret < 0) 
         goto out_error;
     
@@ -297,35 +273,28 @@ out_error:
     return -1;
 }
 
-void *callback(char *useless, const struct pcap_pkthdr *pkthdr, 
+void callback(char *useless, const struct pcap_pkthdr *pkthdr, 
                 char *packet)
 {
-    char *http_data;
-    size_t http_data_len;
     char *host;
     int ret;
 
-    http_data = NULL;
-    ret = find_http_data(packet, &http_data, &http_data_len);
+    ret = find_http_data(packet);
     if (ret < 0) 
-        goto pass;
+        return;
 
-    if (find_pattern(http_data, http_data_len) == NULL) 
-        goto pass;
+    if (find_pattern(tcp_data(packet), tcp_data_len(packet)) == NULL) 
+        return;
 
     pr_info("pattern detected!\n");
    
     ret = send_blocking_pkt(packet);
     if (ret < 0) {
         pr_err("Error while sending blocking packets\n");
-        free(http_data);
-        return NULL;
+        return;
     }
 
-pass:
-    if (http_data)
-        free(http_data);
-    return NULL;
+    return;    
 }
 
 pcap_t *init_pcap(const char *device)
