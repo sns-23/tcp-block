@@ -1,7 +1,7 @@
 CC = gcc
-CFLAGS = -g -DLOG_LEVEL=3
+CFLAGS = -g -DUSE_RAWSOCKET
 LDFLAGS = -lpcap
-OBJS = main.o util.o
+OBJS = main.o util.o checksum.o
 
 tcp-block: $(OBJS)
 	$(CC) -o $@ $^ $(CFLAGS) $(LDFLAGS)
@@ -10,7 +10,7 @@ tcp-block: $(OBJS)
 	$(CC) -c -o $@ $< $(CFLAGS) $(LDFLAGS) 
 
 clean:
-	rm -rf block *.o
+	rm -rf tcp-block *.o
 
 .PHONY:
 	tcp-block clean

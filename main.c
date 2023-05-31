@@ -5,10 +5,11 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <sys/ioctl.h>
-#include <linux/if.h>
+#include <linux/if_packet.h>
 #include <netinet/ether.h>
 #include <netinet/ip.h>
 #include <netinet/tcp.h>
+#include <net/if.h>
 
 #include <pcap.h>
 
@@ -16,9 +17,14 @@
 #include "util.h"
 
 #define ARRAY_SIZE(x) (sizeof(x) / sizeof((x)[0]))
-#define FINMSG "HTTP/1.0 302 Redirect\r\nLocation: http://warning.or.kr\r\n\r\n"
-#define pkt_len(pkt) (ntohs(((struct iphdr *)((char *)pkt + ETH_HLEN))->tot_len) + ETH_HLEN)
 
+#define ip_hdr(pkt) ((struct iphdr *)((char *)pkt + ETH_HLEN))
+#define tcp_hdr(pkt) ((struct tcphdr *)((char *)ip_hdr(pkt) + ip_hdr(pkt)->ihl * 4))
+#define pkt_len(pkt) (ntohs(ip_hdr(pkt)->tot_len) + ETH_HLEN)
+
+#define FINMSG "HTTP/1.0 302 Redirect\r\nLocation: http://warning.or.kr\r\n\r\n"
+
+char *interface;
 char *pattern;
 pcap_t *handle;
 struct ether_addr my_mac_addr;
@@ -64,14 +70,6 @@ int find_http_data(char *packet, char **bufptr, size_t *n)
     size_t tcp_data_len;
     char *buf;
 
-    if (*bufptr == NULL)
-        buf = malloc(tcp_data_len + 1);
-    else
-        buf = *bufptr;
-
-    if (buf == NULL)
-        return -1;
-
     ethhdr = packet;
 
     /* ethhdr->h_proto == ETH_P_IP has already been checked by the pcap filter */
@@ -81,6 +79,14 @@ int find_http_data(char *packet, char **bufptr, size_t *n)
     tcphdr = (char *)iphdr + iphdr->ihl * 4;
     tcp_data = (char *)tcphdr + tcphdr->th_off * 4;
     tcp_data_len = ntohs(iphdr->tot_len) - (iphdr->ihl + tcphdr->th_off) * 4;
+
+    if (*bufptr == NULL)
+        buf = malloc(tcp_data_len + 1);
+    else
+        buf = *bufptr;
+
+    if (buf == NULL)
+        return -1;
 
     /* 
      * minimun length of http request is always greater than 16 bytes
@@ -112,6 +118,7 @@ char *gen_forward_pkt(struct ethhdr *org_ethhdr, struct iphdr *org_iphdr, struct
     struct tcphdr *forward_tcphdr;
     char *forward_pkt;
     size_t org_tcpdata_len;
+    uint32_t checksum;
 
     org_tcpdata_len = ntohs(org_iphdr->tot_len) - (org_iphdr->ihl + org_tcphdr->th_off) * 4;
     
@@ -129,18 +136,23 @@ char *gen_forward_pkt(struct ethhdr *org_ethhdr, struct iphdr *org_iphdr, struct
     memcpy(forward_iphdr, org_iphdr, sizeof(*forward_iphdr));
     forward_iphdr->ihl = sizeof(*forward_iphdr) / 4;
     forward_iphdr->tot_len = htons(sizeof(*forward_iphdr) + sizeof(*forward_tcphdr));
+    forward_iphdr->check = 0;
     forward_iphdr->check = ip_fast_csum(forward_iphdr, forward_iphdr->ihl);
 
     forward_tcphdr = (char *)forward_iphdr + sizeof(*forward_iphdr);
     memcpy(forward_tcphdr, org_tcphdr, sizeof(*forward_tcphdr));
-    forward_tcphdr->th_seq = org_tcphdr->th_seq + org_tcpdata_len;
-    forward_tcphdr->th_off = sizeof(*forward_tcphdr);
+    forward_tcphdr->th_seq = htonl(ntohl(org_tcphdr->th_seq) + org_tcpdata_len);
+    forward_tcphdr->th_off = sizeof(*forward_tcphdr) / 4;
     forward_tcphdr->th_flags = 0;
     forward_tcphdr->rst = true;
-    forward_tcphdr->syn = false;
+    forward_tcphdr->psh = true;
     forward_tcphdr->ack = true;
-    forward_tcphdr->th_sum = csum_tcpudp_magic(forward_iphdr->saddr, forward_iphdr->daddr, 0, IPPROTO_TCP, 0);
+    forward_tcphdr->th_sum = 0;
 
+    checksum = csum_partial(forward_tcphdr, ntohs(forward_iphdr->tot_len) - forward_iphdr->ihl * 4, 0);
+    forward_tcphdr->th_sum = csum_tcpudp_magic(forward_iphdr->saddr, forward_iphdr->daddr, 
+                                               ntohs(forward_iphdr->tot_len) - forward_iphdr->ihl * 4, 
+                                               forward_iphdr->protocol, checksum);
     return forward_pkt;
 }
 
@@ -151,6 +163,7 @@ char *gen_backward_pkt(struct ethhdr *org_ethhdr, struct iphdr *org_iphdr, struc
     struct tcphdr *backward_tcphdr;
     char *backward_pkt;
     size_t org_tcpdata_len;
+    uint32_t checksum;
 
     org_tcpdata_len = ntohs(org_iphdr->tot_len) - (org_iphdr->ihl + org_tcphdr->th_off) * 4;
     
@@ -168,27 +181,57 @@ char *gen_backward_pkt(struct ethhdr *org_ethhdr, struct iphdr *org_iphdr, struc
     /* There are no additional options */
     memcpy(backward_iphdr, org_iphdr, sizeof(*backward_iphdr));
     backward_iphdr->ihl = sizeof(*backward_iphdr) / 4;
-    backward_iphdr->tot_len = htons(sizeof(*backward_iphdr) + sizeof(backward_tcphdr) + sizeof(FINMSG) - 1);
+    backward_iphdr->tot_len = htons(sizeof(*backward_iphdr) + sizeof(*backward_tcphdr) + sizeof(FINMSG) - 1);
     backward_iphdr->ttl = 128;
     backward_iphdr->saddr = org_iphdr->daddr;
     backward_iphdr->daddr = org_iphdr->saddr;
+    backward_iphdr->check = 0;
     backward_iphdr->check = ip_fast_csum(backward_iphdr, backward_iphdr->ihl);
 
     backward_tcphdr = (char *)backward_iphdr + sizeof(*backward_iphdr);
     memcpy(backward_tcphdr, org_tcphdr, sizeof(*backward_tcphdr));
     backward_tcphdr->th_seq = org_tcphdr->th_ack;
-    backward_tcphdr->th_ack = org_tcphdr->th_seq;
-    backward_tcphdr->th_off = sizeof(*backward_tcphdr);
+    backward_tcphdr->th_ack = htonl(ntohl(org_tcphdr->th_seq) + org_tcpdata_len);
+    backward_tcphdr->th_sport = org_tcphdr->th_dport;
+    backward_tcphdr->th_dport = org_tcphdr->th_sport;
+    backward_tcphdr->th_off = sizeof(*backward_tcphdr) / 4;
     backward_tcphdr->th_flags = 0;
     backward_tcphdr->fin = true;
-    backward_tcphdr->syn = false;
+    backward_tcphdr->psh = true;
     backward_tcphdr->ack = true;
-    backward_tcphdr->th_sum = csum_tcpudp_magic(backward_iphdr->saddr, backward_iphdr->daddr, sizeof(FINMSG) - 1, IPPROTO_TCP, 0);
+    backward_tcphdr->th_sum = 0;
 
     memcpy(backward_tcphdr + 1, FINMSG, sizeof(FINMSG) - 1);
 
+    checksum = csum_partial(backward_tcphdr, ntohs(backward_iphdr->tot_len) - backward_iphdr->ihl * 4, 0);
+    backward_tcphdr->th_sum = csum_tcpudp_magic(backward_iphdr->saddr, backward_iphdr->daddr, 
+                                                ntohs(backward_iphdr->tot_len) - backward_iphdr->ihl * 4, 
+                                                backward_iphdr->protocol, checksum);
+
     return backward_pkt;
 }
+
+#ifdef USE_RAWSOCKET
+int init_raw_sk()
+{
+    int sk;
+    int flag = true;
+
+    sk = socket(AF_INET, SOCK_RAW, IPPROTO_RAW);
+    if (sk < 0) {
+        pr_err("socket()\n");
+        return -1;
+    }
+        
+    if (setsockopt(sk, IPPROTO_IP, IP_HDRINCL, &flag, sizeof(flag)) < 0) {
+        pr_err("setsockopt()\n");
+        close(sk);
+        return -1;
+    }
+
+    return sk;
+}
+#endif
 
 int send_blocking_pkt(char *org_pkt)
 {
@@ -200,8 +243,8 @@ int send_blocking_pkt(char *org_pkt)
     int ret;
 
     org_ethhdr = org_pkt;
-    org_iphdr = (char *)org_ethhdr + ETH_HLEN;
-    org_tcphdr = (char *)org_iphdr + org_iphdr->ihl * 4;
+    org_iphdr = ip_hdr(org_pkt);
+    org_tcphdr = tcp_hdr(org_pkt);
     
     forward_pkt = gen_forward_pkt(org_ethhdr, org_iphdr, org_tcphdr);
     if (forward_pkt == NULL)
@@ -210,20 +253,36 @@ int send_blocking_pkt(char *org_pkt)
     backward_pkt = gen_backward_pkt(org_ethhdr, org_iphdr, org_tcphdr);
     if (backward_pkt == NULL) 
         goto out_error;
-    
-    pr_info("((struct iphdr *)((char *)pkt + ETH_HLEN))->tot_len: %x\n", ((struct iphdr *)((char *)forward_pkt + ETH_HLEN))->tot_len);
-    pr_info("pkt_len(forward_pkt): %x\n", pkt_len(forward_pkt));
+
     ret = pcap_sendpacket(handle, forward_pkt, pkt_len(forward_pkt));
     if (ret < 0) 
         goto out_error;
 
-    pr_info("pkt_len(backward_pkt): %x\n", pkt_len(backward_pkt));
+#ifdef USE_RAWSOCKET
+    struct sockaddr_in addr;
+    int sk;
+
+    sk = init_raw_sk();
+    if (sk < 0)
+        return -1;
+
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = tcp_hdr(backward_pkt)->th_dport;
+    addr.sin_addr.s_addr = ip_hdr(backward_pkt)->daddr;
+    ret = sendto(sk, ip_hdr(backward_pkt), ntohs(ip_hdr(backward_pkt)->tot_len), 0, &addr, sizeof(addr));
+    if (ret < 0) 
+        goto out_error;
+    
+    close(sk);
+#else
     ret = pcap_sendpacket(handle, backward_pkt, pkt_len(backward_pkt));
     if (ret < 0) 
         goto out_error;
+#endif
 
     free(forward_pkt);
-    free(backward_pkt);      
+    free(backward_pkt);    
 
     return 0;
 
@@ -232,6 +291,9 @@ out_error:
         free(forward_pkt);
     if (backward_pkt)
         free(backward_pkt);
+#ifdef USE_RAWSOCKET
+    close(sk);
+#endif
     return -1;
 }
 
@@ -326,12 +388,13 @@ int resolve_my_mac(char *interface)
     if (ret < 0) 
         return -1;
 
+    memcpy(&my_mac_addr, ifr.ifr_hwaddr.sa_data, ETH_ALEN);
+
     return 0;
 }
 
 int main(int argc, char *argv[])
 {
-    char *interface;
     int ret;
 
     if (argc != 3) {
@@ -356,8 +419,11 @@ int main(int argc, char *argv[])
     ret = pcap_loop(handle, 0, callback, NULL);
     if (ret < 0) {
         pr_err("pcap_loop()\n");
+        pcap_close(handle);
         return -1;
     }
+
+    pcap_close(handle);
 
     return 0;
 }

@@ -4,16 +4,41 @@
 
 #define __force __attribute__((force))
 
+typedef __u32 u32;
+typedef __u64 u64;
+
+/*
+ * computes the checksum of a memory block at buff, length len,
+ * and adds in "sum" (32-bit)
+ *
+ * returns a 32-bit number suitable for feeding into itself
+ * or csum_tcpudp_magic
+ *
+ * this function must be called with even lengths, except
+ * for the last fragment, which may be odd
+ *
+ * it's best to have buff aligned on a 32-bit boundary
+ */
+extern __wsum csum_partial(const void *buff, int len, __wsum sum);
+
+/**
+ * csum_fold - Fold and invert a 32bit checksum.
+ * sum: 32bit unfolded sum
+ *
+ * Fold a 32bit running checksum to 16bit and invert it. This is usually
+ * the last step before putting a checksum into a packet.
+ * Make sure not to mix with 64bit checksums.
+ */
 static inline __sum16 csum_fold(__wsum sum)
 {
 	__asm__(
 		"  addl %1,%0\n"
 		"  adcl $0xffff,%0"
 		: "=r" (sum)
-		: "r" ((__force __u32)sum << 16),
-		  "0" ((__force __u32)sum & 0xffff0000)
+		: "r" ((__force u32)sum << 16),
+		  "0" ((__force u32)sum & 0xffff0000)
 	);
-	return (__force __sum16)(~(__force __u32)sum >> 16);
+	return (__force __sum16)(~(__force u32)sum >> 16);
 }
 
 /**
