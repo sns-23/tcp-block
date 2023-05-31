@@ -223,40 +223,51 @@ int send_blocking_pkt(char *org_pkt)
     int ret;
     
     forward_pkt = gen_forward_pkt(org_pkt);
-    if (forward_pkt == NULL)
+    if (forward_pkt == NULL) {
+        pr_err("There is no memory\n");
         goto out_error;
+    }
 
     backward_pkt = gen_backward_pkt(org_pkt);
-    if (backward_pkt == NULL) 
+    if (backward_pkt == NULL) {
+        pr_err("There is no memory\n");
         goto out_error;
+    }
 
     ret = pcap_sendpacket(handle, forward_pkt, pkt_len(forward_pkt));
-    if (ret < 0) 
+    if (ret < 0) {
+        pr_err("Failed to send forward packet\n");
         goto out_error;
+    }
 
 #ifdef USE_RAWSOCKET
     struct sockaddr_in addr;
     int sk;
 
     sk = init_raw_sk();
-    if (sk < 0)
-        return -1;
+    if (sk < 0) {
+        pr_err("Failed to initialize raw socket\n");
+        goto out_error;
+    }
 
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
     addr.sin_port = tcp_hdr(backward_pkt)->th_dport;
     addr.sin_addr.s_addr = ip_hdr(backward_pkt)->daddr;
     ret = sendto(sk, ip_hdr(backward_pkt), ip_len(backward_pkt), 0, &addr, sizeof(addr));
-    if (ret < 0) 
-        goto out_error;
-    
     close(sk);
+
+    if (ret < 0) {
+        pr_err("Failed to send backward pakcet\n");
+        goto out_error;
+    }   
 #else
     ret = pcap_sendpacket(handle, backward_pkt, pkt_len(backward_pkt));
-    if (ret < 0) 
+    if (ret < 0) {
+        pr_err("Failed to send backward pakcet\n");
         goto out_error;
+    }
 #endif
-
     free(forward_pkt);
     free(backward_pkt);    
 
@@ -267,9 +278,7 @@ out_error:
         free(forward_pkt);
     if (backward_pkt)
         free(backward_pkt);
-#ifdef USE_RAWSOCKET
-    close(sk);
-#endif
+
     return -1;
 }
 
